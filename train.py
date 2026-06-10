@@ -143,9 +143,11 @@ def main():
     # --- Step 5: Train ---
     trainer = CALoRATrainer(config, device=args.device)
 
-    if target_feats is None:
-        target_feats = trainer.precompute_features(real_paths)
-    if anchor_feats is None:
+    # Recompute features in latent space for training (anchor selection used DINOv2, training uses VAE latents)
+    target_feats = trainer.precompute_features(real_paths)
+    if anchor_paths:
+        anchor_feats = trainer.precompute_features(anchor_paths)
+    else:
         anchor_feats = torch.zeros(1, target_feats.shape[-1], device=args.device)
 
     # Ablation: disable diversity loss

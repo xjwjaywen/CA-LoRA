@@ -60,10 +60,7 @@ class CALoRATrainer:
         self.unet.print_trainable_parameters()
 
     def _load_feature_extractor(self):
-        train_cfg = self.config["training"]
-        self.feat_model, self.feat_transform = load_feature_extractor(
-            train_cfg.get("feature_extractor", "dinov2"), self.device
-        )
+        pass
 
     @torch.no_grad()
     def _encode_prompt(self, prompt: str, batch_size: int = 1):
@@ -83,9 +80,21 @@ class CALoRATrainer:
 
     @torch.no_grad()
     def precompute_features(self, image_paths: list) -> torch.Tensor:
+        """Encode images to latent space and pool to feature vectors."""
         from PIL import Image as PILImage
+        from torchvision import transforms
+        transform = transforms.Compose([
+            transforms.Resize(self.config["model"]["resolution"],
+                              interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(self.config["model"]["resolution"]),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ])
         images = [PILImage.open(p).convert("RGB") for p in image_paths]
-        return extract_features(images, self.feat_model, self.feat_transform, self.device)
+        tensors = torch.stack([transform(img) for img in images]).to(self.device, dtype=torch.float16)
+        latents = self.vae.encode(tensors).latent_dist.sample() * self.vae.config.scaling_factor
+        features = latents.flatten(start_dim=1)
+        return F.normalize(features.float(), dim=-1)
 
     def train(
         self,
@@ -141,26 +150,13 @@ class CALoRATrainer:
             ).sample
             denoise_loss = F.mse_loss(noise_pred.float(), noise.float())
 
-            # Estimate x_0 from noise prediction (predicted clean image)
+            # Estimate x_0 from noise prediction in latent space (no VAE decode)
             alpha_prod = self.noise_scheduler.alphas_cumprod.to(self.device)[timesteps]
             alpha_prod = alpha_prod.view(-1, 1, 1, 1)
             pred_x0 = (noisy_latents - (1 - alpha_prod).sqrt() * noise_pred) / alpha_prod.sqrt()
 
-            # Decode predicted x_0 to pixel space and extract features
-            with torch.no_grad():
-                pred_images = self.vae.decode(
-                    pred_x0.to(dtype=torch.float16) / self.vae.config.scaling_factor
-                ).sample
-                pred_images = ((pred_images.float() + 1) / 2).clamp(0, 1)
-                pred_images_resized = F.interpolate(pred_images, size=224, mode="bilinear")
-                from torchvision.transforms.functional import normalize
-                pred_images_norm = normalize(
-                    pred_images_resized,
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                )
-                pred_features = self.feat_model(pred_images_norm)
-                pred_features = F.normalize(pred_features, dim=-1)
+            # Contrastive loss directly in latent space
+            pred_features = F.normalize(pred_x0.float().flatten(start_dim=1), dim=-1)
 
             reg_losses = compute_feature_losses(
                 pred_features,
