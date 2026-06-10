@@ -22,10 +22,10 @@ training:
   seed: 42
 
   # contrastive loss
-  lambda_anchor: 0.5
-  lambda_diverse: 0.2
-  feature_extractor: "dinov2"  # "dinov2" or "clip"
-  temperature: 0.07
+  lambda_anchor: 0.01
+  lambda_diverse: 0.005
+  feature_extractor: "dinov2"
+  temperature: 0.5
 
   # adaptive mixing schedule
   mixing_schedule: "linear"  # "linear", "cosine", "step"
