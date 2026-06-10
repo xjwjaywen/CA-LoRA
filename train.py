@@ -26,6 +26,8 @@ def main():
     parser.add_argument("--method", type=str, default="ca_lora",
                         choices=["ca_lora", "lora_only", "dreambooth_anchor", "ca_lora_no_diverse",
                                  "ca_lora_no_adaptive", "ca_lora_random_anchor"])
+    parser.add_argument("--model_path", type=str, default=None,
+                        help="Override pretrained model path (local or HuggingFace ID)")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -37,6 +39,8 @@ def main():
         config["dataset"]["class_name"] = args.class_name
     if args.num_shots:
         config["dataset"]["num_shots"] = args.num_shots
+    if args.model_path:
+        config["model"]["pretrained_model"] = args.model_path
 
     dataset_name = config["dataset"]["name"]
     class_name = config["dataset"]["class_name"]
