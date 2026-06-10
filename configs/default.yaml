@@ -22,8 +22,8 @@ training:
   seed: 42
 
   # contrastive loss
-  lambda_anchor: 0.1
-  lambda_diverse: 0.05
+  lambda_anchor: 0.5
+  lambda_diverse: 0.2
   feature_extractor: "dinov2"  # "dinov2" or "clip"
   temperature: 0.07
 

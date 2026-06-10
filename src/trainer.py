@@ -141,21 +141,29 @@ class CALoRATrainer:
             ).sample
             denoise_loss = F.mse_loss(noise_pred.float(), noise.float())
 
-            # Contrastive regularization on batch features
+            # Estimate x_0 from noise prediction (predicted clean image)
+            alpha_prod = self.noise_scheduler.alphas_cumprod.to(self.device)[timesteps]
+            alpha_prod = alpha_prod.view(-1, 1, 1, 1)
+            pred_x0 = (noisy_latents - (1 - alpha_prod).sqrt() * noise_pred) / alpha_prod.sqrt()
+
+            # Decode predicted x_0 to pixel space and extract features
             with torch.no_grad():
-                batch_images = ((pixel_values.float() + 1) / 2).clamp(0, 1)
-                batch_images_resized = F.interpolate(batch_images, size=224, mode="bilinear")
+                pred_images = self.vae.decode(
+                    pred_x0.to(dtype=torch.float16) / self.vae.config.scaling_factor
+                ).sample
+                pred_images = ((pred_images.float() + 1) / 2).clamp(0, 1)
+                pred_images_resized = F.interpolate(pred_images, size=224, mode="bilinear")
                 from torchvision.transforms.functional import normalize
-                batch_images_norm = normalize(
-                    batch_images_resized,
+                pred_images_norm = normalize(
+                    pred_images_resized,
                     mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225],
                 )
-                batch_features = self.feat_model(batch_images_norm)
-                batch_features = F.normalize(batch_features, dim=-1)
+                pred_features = self.feat_model(pred_images_norm)
+                pred_features = F.normalize(pred_features, dim=-1)
 
             reg_losses = compute_feature_losses(
-                batch_features,
+                pred_features,
                 anchor_features,
                 target_features,
                 lambda_anchor=train_cfg["lambda_anchor"],
