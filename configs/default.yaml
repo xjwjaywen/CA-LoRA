@@ -1,0 +1,49 @@
+model:
+  pretrained_model: "stabilityai/stable-diffusion-2-1-base"
+  resolution: 512
+
+lora:
+  rank: 8
+  alpha: 16
+  target_modules: ["to_q", "to_v", "to_k", "to_out.0"]
+
+anchor:
+  num_anchors: 200
+  generation_steps: 30
+  guidance_scale: 7.5
+  selection_strategy: "adaptive"  # "random", "clip_ranked", "adaptive"
+
+training:
+  num_steps: 800
+  learning_rate: 1.0e-4
+  batch_size: 2
+  gradient_accumulation: 2
+  mixed_precision: "fp16"
+  seed: 42
+
+  # contrastive loss
+  lambda_anchor: 0.1
+  lambda_diverse: 0.05
+  feature_extractor: "dinov2"  # "dinov2" or "clip"
+  temperature: 0.07
+
+  # adaptive mixing schedule
+  mixing_schedule: "linear"  # "linear", "cosine", "step"
+  anchor_ratio_start: 0.7
+  anchor_ratio_end: 0.2
+
+dataset:
+  name: "cub200"  # "cub200", "mvtec", "flowers"
+  data_dir: "./data"
+  num_shots: 10
+  class_name: null  # specify target class
+
+evaluation:
+  eval_every: 100
+  num_eval_images: 50
+  metrics: ["fid", "lpips_diversity", "dino_similarity", "clip_score"]
+
+output:
+  output_dir: "./outputs"
+  save_every: 200
+  log_every: 10

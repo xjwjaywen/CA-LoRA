@@ -1,0 +1,222 @@
+"""CA-LoRA training loop."""
+import torch
+import torch.nn.functional as F
+from pathlib import Path
+from tqdm import tqdm
+from diffusers import (
+    StableDiffusionPipeline,
+    DDPMScheduler,
+    AutoencoderKL,
+    UNet2DConditionModel,
+)
+from transformers import CLIPTextModel, CLIPTokenizer
+from peft import LoraConfig, get_peft_model
+from torch.utils.data import DataLoader
+
+from .losses import compute_feature_losses
+from .anchor_selector import (
+    load_feature_extractor,
+    extract_features,
+    AnchorMixingScheduler,
+)
+
+
+class CALoRATrainer:
+    def __init__(self, config: dict, device: str = "cuda"):
+        self.config = config
+        self.device = device
+        self._load_model()
+        self._setup_lora()
+        self._load_feature_extractor()
+
+    def _load_model(self):
+        model_id = self.config["model"]["pretrained_model"]
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+        self.text_encoder = CLIPTextModel.from_pretrained(
+            model_id, subfolder="text_encoder", torch_dtype=torch.float16
+        ).to(self.device)
+        self.vae = AutoencoderKL.from_pretrained(
+            model_id, subfolder="vae", torch_dtype=torch.float16
+        ).to(self.device)
+        self.unet = UNet2DConditionModel.from_pretrained(
+            model_id, subfolder="unet", torch_dtype=torch.float16
+        ).to(self.device)
+        self.noise_scheduler = DDPMScheduler.from_pretrained(
+            model_id, subfolder="scheduler"
+        )
+
+        self.text_encoder.requires_grad_(False)
+        self.vae.requires_grad_(False)
+
+    def _setup_lora(self):
+        lora_cfg = self.config["lora"]
+        lora_config = LoraConfig(
+            r=lora_cfg["rank"],
+            lora_alpha=lora_cfg["alpha"],
+            target_modules=lora_cfg["target_modules"],
+            lora_dropout=0.0,
+        )
+        self.unet = get_peft_model(self.unet, lora_config)
+        self.unet.print_trainable_parameters()
+
+    def _load_feature_extractor(self):
+        train_cfg = self.config["training"]
+        self.feat_model, self.feat_transform = load_feature_extractor(
+            train_cfg.get("feature_extractor", "dinov2"), self.device
+        )
+
+    @torch.no_grad()
+    def _encode_prompt(self, prompt: str, batch_size: int = 1):
+        tokens = self.tokenizer(
+            [prompt] * batch_size,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids.to(self.device)
+        return self.text_encoder(tokens)[0]
+
+    @torch.no_grad()
+    def _encode_images(self, pixel_values: torch.Tensor):
+        latents = self.vae.encode(pixel_values.to(dtype=torch.float16)).latent_dist.sample()
+        return latents * self.vae.config.scaling_factor
+
+    @torch.no_grad()
+    def precompute_features(self, image_paths: list) -> torch.Tensor:
+        from PIL import Image as PILImage
+        images = [PILImage.open(p).convert("RGB") for p in image_paths]
+        return extract_features(images, self.feat_model, self.feat_transform, self.device)
+
+    def train(
+        self,
+        dataloader: DataLoader,
+        target_features: torch.Tensor,
+        anchor_features: torch.Tensor,
+        mixing_scheduler: AnchorMixingScheduler,
+    ):
+        train_cfg = self.config["training"]
+        output_dir = Path(self.config["output"]["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        optimizer = torch.optim.AdamW(
+            self.unet.parameters(), lr=train_cfg["learning_rate"]
+        )
+
+        num_steps = train_cfg["num_steps"]
+        grad_accum = train_cfg["gradient_accumulation"]
+        log_every = self.config["output"]["log_every"]
+        save_every = self.config["output"]["save_every"]
+
+        self.unet.train()
+        data_iter = iter(dataloader)
+        progress = tqdm(range(num_steps), desc="Training CA-LoRA")
+        running_losses = {"denoise": 0, "anchor": 0, "diverse": 0}
+
+        for step in progress:
+            # Update mixing ratio
+            ratio = mixing_scheduler.get_ratio(step)
+            dataloader.dataset.set_anchor_ratio(ratio)
+
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
+
+            pixel_values = batch["pixel_values"].to(self.device, dtype=torch.float16)
+            prompt = batch["prompt"][0]
+
+            latents = self._encode_images(pixel_values)
+            encoder_hidden_states = self._encode_prompt(prompt, latents.shape[0])
+
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(
+                0, self.noise_scheduler.config.num_train_timesteps,
+                (latents.shape[0],), device=self.device,
+            ).long()
+            noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+
+            noise_pred = self.unet(
+                noisy_latents, timesteps, encoder_hidden_states
+            ).sample
+            denoise_loss = F.mse_loss(noise_pred.float(), noise.float())
+
+            # Contrastive regularization on batch features
+            with torch.no_grad():
+                batch_images = ((pixel_values.float() + 1) / 2).clamp(0, 1)
+                batch_images_resized = F.interpolate(batch_images, size=224, mode="bilinear")
+                from torchvision.transforms.functional import normalize
+                batch_images_norm = normalize(
+                    batch_images_resized,
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                )
+                batch_features = self.feat_model(batch_images_norm)
+                batch_features = F.normalize(batch_features, dim=-1)
+
+            reg_losses = compute_feature_losses(
+                batch_features,
+                anchor_features,
+                target_features,
+                lambda_anchor=train_cfg["lambda_anchor"],
+                lambda_diverse=train_cfg["lambda_diverse"],
+                temperature=train_cfg["temperature"],
+            )
+
+            total_loss = denoise_loss + reg_losses["loss_reg_total"]
+            total_loss = total_loss / grad_accum
+            total_loss.backward()
+
+            if (step + 1) % grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(self.unet.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            running_losses["denoise"] += denoise_loss.item()
+            running_losses["anchor"] += reg_losses["loss_anchor"].item()
+            running_losses["diverse"] += reg_losses["loss_diverse"].item()
+
+            if (step + 1) % log_every == 0:
+                avg = {k: v / log_every for k, v in running_losses.items()}
+                progress.set_postfix(
+                    denoise=f"{avg['denoise']:.4f}",
+                    anchor=f"{avg['anchor']:.4f}",
+                    diverse=f"{avg['diverse']:.4f}",
+                    mix_ratio=f"{ratio:.2f}",
+                )
+                running_losses = {k: 0 for k in running_losses}
+
+            if (step + 1) % save_every == 0:
+                self.save_lora(output_dir / f"checkpoint-{step+1}")
+
+        self.save_lora(output_dir / "final")
+        print(f"Training complete. Model saved to {output_dir / 'final'}")
+
+    def save_lora(self, path: Path):
+        path.mkdir(parents=True, exist_ok=True)
+        self.unet.save_pretrained(path)
+        print(f"LoRA saved to {path}")
+
+    @torch.no_grad()
+    def generate(self, prompt: str, num_images: int = 8, seed: int = 0):
+        pipe = StableDiffusionPipeline.from_pretrained(
+            self.config["model"]["pretrained_model"],
+            unet=self.unet,
+            torch_dtype=torch.float16,
+        ).to(self.device)
+
+        generator = torch.Generator(device=self.device)
+        images = []
+        for i in range(num_images):
+            generator.manual_seed(seed + i)
+            img = pipe(
+                prompt,
+                num_inference_steps=30,
+                guidance_scale=7.5,
+                generator=generator,
+            ).images[0]
+            images.append(img)
+
+        del pipe
+        torch.cuda.empty_cache()
+        return images
