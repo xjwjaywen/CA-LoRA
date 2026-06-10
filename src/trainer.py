@@ -79,8 +79,8 @@ class CALoRATrainer:
         return latents * self.vae.config.scaling_factor
 
     @torch.no_grad()
-    def precompute_features(self, image_paths: list) -> torch.Tensor:
-        """Encode images to latent space and pool to feature vectors."""
+    def precompute_features(self, image_paths: list, batch_size: int = 4) -> torch.Tensor:
+        """Encode images to latent space and pool to feature vectors (batched)."""
         from PIL import Image as PILImage
         from torchvision import transforms
         transform = transforms.Compose([
@@ -90,11 +90,17 @@ class CALoRATrainer:
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ])
-        images = [PILImage.open(p).convert("RGB") for p in image_paths]
-        tensors = torch.stack([transform(img) for img in images]).to(self.device, dtype=torch.float16)
-        latents = self.vae.encode(tensors).latent_dist.sample() * self.vae.config.scaling_factor
-        features = latents.flatten(start_dim=1)
-        return F.normalize(features.float(), dim=-1)
+        all_features = []
+        for i in range(0, len(image_paths), batch_size):
+            batch_paths = image_paths[i:i + batch_size]
+            images = [PILImage.open(p).convert("RGB") for p in batch_paths]
+            tensors = torch.stack([transform(img) for img in images]).to(self.device, dtype=torch.float16)
+            latents = self.vae.encode(tensors).latent_dist.sample() * self.vae.config.scaling_factor
+            all_features.append(latents.flatten(start_dim=1).float())
+            del tensors, latents
+            torch.cuda.empty_cache()
+        features = torch.cat(all_features, dim=0)
+        return F.normalize(features, dim=-1)
 
     def train(
         self,

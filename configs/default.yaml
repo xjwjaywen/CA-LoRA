@@ -8,7 +8,7 @@ lora:
   target_modules: ["to_q", "to_v", "to_k", "to_out.0"]
 
 anchor:
-  num_anchors: 200
+  num_anchors: 50
   generation_steps: 30
   guidance_scale: 7.5
   selection_strategy: "adaptive"  # "random", "clip_ranked", "adaptive"
